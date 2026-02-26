@@ -1,660 +1,760 @@
-# chainable_pedal_autoload_presets.py
-import sys
-import os
+"""
+chainablepedal_dpg_numpy_params.py
+DearPyGui + Numba DSP + Audio Device Select + SR/BlockSize変更
++ エフェクトON/OFF + 削除 + プリセット保存/読込 + CPUメーター
++ パラメータ NumPy 化（DSP 最適化 & ほぼ lock-free）
+現代 DAW プラグイン風チェイン型エフェクター（モノラル処理）
+"""
+
+import math
+import threading
 import json
 import time
+from dataclasses import dataclass, field
+from typing import Dict, List
+
 import numpy as np
 import sounddevice as sd
-from PyQt5 import QtWidgets, QtCore
-from numba import njit
+import dearpygui.dearpygui as dpg
+import numba as nb
 
-# ====== 設定 ======
-SR = 48000
-BLOCKSIZE = 256
-CHANNELS = 2
-DTYPE = np.float32
-PRESET_DIR = "presets"
 
-os.makedirs(PRESET_DIR, exist_ok=True)
+# ============================================================
+#  基本設定（GUI から変更可能）
+# ============================================================
 
-# ====== numba コア関数群 ======
-@njit(cache=True)
-def tanh_distort_block(x, out, gain, b0, a1, y_prev, drywet):
-    y = y_prev
+SAMPLE_RATE = 48000
+BLOCK_SIZE = 256
+
+current_input_device = None
+current_output_device = None
+audio_stream = None
+
+cpu_load = 0.0
+cpu_lock = threading.Lock()
+
+PRESET_FILE = "chainable_pedal_preset.json"
+
+
+# ============================================================
+#  Numba DSP 実装
+# ============================================================
+
+@nb.njit(cache=True)
+def dsp_distortion(x, params):
+    gain = params[0]
+    mix = params[1]
+    y = np.empty_like(x)
     for i in range(x.shape[0]):
-        xd = np.tanh(gain * x[i])
-        yn = b0 * xd - a1 * y
-        out[i] = drywet * yn + (1.0 - drywet) * x[i]
-        y = yn
+        v = x[i]
+        d = math.tanh(gain * v)
+        y[i] = (1.0 - mix) * v + mix * d
     return y
 
-@njit(cache=True)
-def chorus_block(x, out, sr, depth_ms, rate_hz, mix, lfo_phase, delay_buf, buf_pos):
-    N = x.shape[0]
-    buf_len = delay_buf.shape[0]
-    phase = lfo_phase
-    two_pi = 2.0 * np.pi
-    depth_samples = depth_ms * sr / 1000.0
-    for i in range(N):
-        lfo = np.sin(phase)
-        phase += two_pi * rate_hz / sr
+
+@nb.njit(cache=True)
+def dsp_chorus(x, params, sr, phase_in):
+    rate = params[0]
+    depth_ms = params[1]
+    mix = params[2]
+
+    n = x.shape[0]
+    y = np.empty_like(x)
+
+    max_delay_samp = int(depth_ms * sr * 0.001) + 2
+    if max_delay_samp < 2:
+        max_delay_samp = 2
+
+    buf = np.zeros(max_delay_samp + n, dtype=x.dtype)
+
+    phase = phase_in
+    two_pi = 2.0 * math.pi
+    for i in range(n):
+        lfo = math.sin(phase)
+        delay_samp = int(depth_ms * 0.5 * (1.0 + lfo) * sr * 0.001)
+        if delay_samp < 0:
+            delay_samp = 0
+        if delay_samp > max_delay_samp - 1:
+            delay_samp = max_delay_samp - 1
+
+        buf[max_delay_samp + i] = x[i]
+        d = buf[max_delay_samp + i - delay_samp]
+        y[i] = (1.0 - mix) * x[i] + mix * d
+
+        phase += two_pi * rate / sr
         if phase > two_pi:
             phase -= two_pi
-        delay = 1.5 + (lfo * depth_samples)
-        read_pos = buf_pos - int(delay)
-        frac = delay - int(delay)
+
+    return y, phase
+
+
+@nb.njit(cache=True)
+def dsp_delay(x, params, sr, buf, write_pos_in):
+    time_ms = params[0]
+    feedback = params[1]
+    mix = params[2]
+
+    n = x.shape[0]
+    y = np.empty_like(x)
+    delay_samp = int(time_ms * sr * 0.001)
+    if delay_samp < 1:
+        delay_samp = 1
+    if delay_samp >= buf.shape[0]:
+        delay_samp = buf.shape[0] - 1
+
+    write_pos = write_pos_in
+    for i in range(n):
+        read_pos = write_pos - delay_samp
         if read_pos < 0:
-            read_pos += buf_len
-        read_pos_next = read_pos + 1
-        if read_pos_next >= buf_len:
-            read_pos_next -= buf_len
-        s0 = delay_buf[read_pos]
-        s1 = delay_buf[read_pos_next]
-        delayed = (1.0 - frac) * s0 + frac * s1
-        delay_buf[buf_pos] = x[i]
-        buf_pos += 1
-        if buf_pos >= buf_len:
-            buf_pos = 0
-        out[i] = (1.0 - mix) * x[i] + mix * delayed
-    return phase, buf_pos
+            read_pos += buf.shape[0]
+        d = buf[read_pos]
+        v = x[i] + feedback * d
+        buf[write_pos] = v
+        write_pos += 1
+        if write_pos >= buf.shape[0]:
+            write_pos = 0
+        y[i] = (1.0 - mix) * x[i] + mix * d
 
-@njit(cache=True)
-def delay_block(x, out, buf, buf_pos, buf_len, delay_samples, feedback, mix):
-    N = x.shape[0]
-    ypos = buf_pos
-    for i in range(N):
-        read_pos = ypos - int(delay_samples)
-        frac = delay_samples - int(delay_samples)
-        if read_pos < 0:
-            read_pos += buf_len
-        read_pos_next = read_pos + 1
-        if read_pos_next >= buf_len:
-            read_pos_next -= buf_len
-        s0 = buf[read_pos]
-        s1 = buf[read_pos_next]
-        delayed = (1.0 - frac) * s0 + frac * s1
-        out[i] = (1.0 - mix) * x[i] + mix * delayed
-        buf[ypos] = x[i] + delayed * feedback
-        ypos += 1
-        if ypos >= buf_len:
-            ypos = 0
-    return ypos
+    return y, write_pos
 
-@njit(cache=True)
-def reverb_block(x, out, buf, buf_len, pos, taps, gains, lp_b0, lp_a1, lp_state):
-    N = x.shape[0]
-    for i in range(N):
-        inp = x[i]
-        acc = 0.0
-        for t in range(taps.shape[0]):
-            tap = taps[t]
-            read_pos = pos - int(tap)
-            if read_pos < 0:
-                read_pos += buf_len
-            acc += buf[read_pos] * gains[t]
-        wet = acc
-        out[i] = 0.5 * inp + 0.5 * wet
-        fb = inp + wet * 0.7
-        lp_out = lp_b0 * fb - lp_a1 * lp_state[0]
-        lp_state[0] = lp_out
-        buf[pos] = lp_out
-        pos += 1
-        if pos >= buf_len:
-            pos = 0
-    return pos
 
-def one_pole_coeffs(cutoff, sr):
-    x = np.exp(-2.0 * np.pi * cutoff / sr)
-    b0 = 1.0 - x
-    a1 = -x
-    return np.float32(b0), np.float32(a1)
+@nb.njit(cache=True)
+def dsp_reverb(x, params, buf, idx_in):
+    size = params[0]
+    damp = params[1]
+    mix = params[2]
 
-# ====== エフェクトクラス群 ======
-class Distortion:
-    def __init__(self, sr, blocksize):
-        self.sr = sr; self.blocksize = blocksize
-        self.gain = 6.0; self.cutoff = 6000.0; self.drywet = 1.0
-        self.b0, self.a1 = one_pole_coeffs(self.cutoff, sr)
-        self.y_prev = np.float32(0.0)
-        self.tmp = np.zeros(blocksize, dtype=DTYPE)
-        self.enabled = True; self.name = "Distortion"
+    n = x.shape[0]
+    y = np.empty_like(x)
+    fb = 0.6 * size
+    lp = 0.2 + 0.7 * (1.0 - damp)
 
-    def clone(self):
-        new = Distortion(self.sr, self.blocksize)
-        new.gain = float(self.gain); new.cutoff = float(self.cutoff); new.drywet = float(self.drywet)
-        new.b0 = float(self.b0); new.a1 = float(self.a1); new.y_prev = np.float32(self.y_prev)
-        new.enabled = bool(self.enabled)
-        return new
+    idx = idx_in
+    prev = 0.0
+    for i in range(n):
+        v = x[i] + fb * buf[idx]
+        prev = lp * v + (1.0 - lp) * prev
+        buf[idx] = prev
+        idx += 1
+        if idx >= buf.shape[0]:
+            idx = 0
+        y[i] = (1.0 - mix) * x[i] + mix * prev
 
-    def to_dict(self):
-        return {"type":"Distortion","gain":self.gain,"cutoff":self.cutoff,"drywet":self.drywet,"enabled":self.enabled}
+    return y, idx
 
-    @staticmethod
-    def from_dict(d, sr, blocksize):
-        e = Distortion(sr, blocksize)
-        e.gain = float(d.get("gain", e.gain))
-        e.cutoff = float(d.get("cutoff", e.cutoff))
-        e.drywet = float(d.get("drywet", e.drywet))
-        e.enabled = bool(d.get("enabled", e.enabled))
-        return e
 
-    def process(self, in_mono):
-        if not self.enabled:
-            self.tmp[:in_mono.shape[0]] = in_mono; return self.tmp
-        self.b0, self.a1 = one_pole_coeffs(self.cutoff, self.sr)
-        self.y_prev = tanh_distort_block(in_mono, self.tmp,
-                                         np.float32(self.gain),
-                                         np.float32(self.b0),
-                                         np.float32(self.a1),
-                                         np.float32(self.y_prev),
-                                         np.float32(self.drywet))
-        return self.tmp
+# ============================================================
+#  エフェクトレジストリ（メタデータ）
+# ============================================================
 
-class Chorus:
-    def __init__(self, sr, blocksize):
-        self.sr = sr; self.blocksize = blocksize
-        self.depth_ms = 5.0; self.rate_hz = 0.8; self.mix = 0.5
-        self.buf_len = int(sr * 2.0); self.buf = np.zeros(self.buf_len, dtype=DTYPE)
-        self.pos = 0; self.phase = 0.0; self.tmp = np.zeros(blocksize, dtype=DTYPE)
-        self.enabled = True; self.name = "Chorus"
+# name: (min, max, default)
+EFFECT_REGISTRY: Dict[str, Dict] = {
+    "Distortion": {
+        "color": (255, 140, 0),
+        "params": [
+            ("gain", 0.0, 20.0, 5.0),
+            ("mix",  0.0, 1.0,  0.7),
+        ],
+    },
+    "Chorus": {
+        "color": (80, 160, 255),
+        "params": [
+            ("rate",  0.1, 5.0, 1.2),
+            ("depth", 0.1, 10.0, 3.0),  # ms
+            ("mix",   0.0, 1.0,  0.4),
+        ],
+    },
+    "Delay": {
+        "color": (180, 120, 255),
+        "params": [
+            ("time",     20.0, 800.0, 380.0),  # ms
+            ("feedback", 0.0,  0.95,  0.4),
+            ("mix",      0.0,  1.0,   0.35),
+        ],
+    },
+    "Reverb": {
+        "color": (120, 220, 160),
+        "params": [
+            ("size", 0.1, 1.0, 0.6),
+            ("damp", 0.0, 1.0, 0.3),
+            ("mix",  0.0, 1.0, 0.25),
+        ],
+    },
+}
 
-    def clone(self):
-        new = Chorus(self.sr, self.blocksize)
-        new.depth_ms = float(self.depth_ms); new.rate_hz = float(self.rate_hz); new.mix = float(self.mix)
-        new.pos = int(self.pos); new.phase = float(self.phase); new.buf = np.copy(self.buf)
-        new.enabled = bool(self.enabled)
-        return new
 
-    def to_dict(self):
-        return {"type":"Chorus","depth_ms":self.depth_ms,"rate_hz":self.rate_hz,"mix":self.mix,"enabled":self.enabled}
+def get_param_meta(effect_type: str):
+    meta = EFFECT_REGISTRY[effect_type]
+    return meta["params"]  # list of (name, min, max, default)
 
-    @staticmethod
-    def from_dict(d, sr, blocksize):
-        e = Chorus(sr, blocksize)
-        e.depth_ms = float(d.get("depth_ms", e.depth_ms))
-        e.rate_hz = float(d.get("rate_hz", e.rate_hz))
-        e.mix = float(d.get("mix", e.mix))
-        e.enabled = bool(d.get("enabled", e.enabled))
-        return e
 
-    def process(self, in_mono):
-        if not self.enabled:
-            self.tmp[:in_mono.shape[0]] = in_mono; return self.tmp
-        phase, pos = chorus_block(in_mono, self.tmp, self.sr,
-                                  np.float32(self.depth_ms),
-                                  np.float32(self.rate_hz),
-                                  np.float32(self.mix),
-                                  np.float32(self.phase),
-                                  self.buf, self.pos)
-        self.phase = phase; self.pos = pos
-        return self.tmp
+# ============================================================
+#  エフェクトインスタンス（NumPy パラメータ）
+# ============================================================
 
-class Delay:
-    def __init__(self, sr, blocksize):
-        self.sr = sr; self.blocksize = blocksize
-        self.time_ms = 350.0; self.feedback = 0.35; self.mix = 0.35
-        self.max_sec = 5.0; self.buf_len = int(sr * self.max_sec); self.buf = np.zeros(self.buf_len, dtype=DTYPE)
-        self.pos = 0; self.tmp = np.zeros(blocksize, dtype=DTYPE)
-        self.enabled = True; self.name = "Delay"
+@dataclass
+class EffectInstance:
+    effect_type: str
+    enabled: bool = True
+    params: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.float32))
 
-    def clone(self):
-        new = Delay(self.sr, self.blocksize)
-        new.time_ms = float(self.time_ms); new.feedback = float(self.feedback); new.mix = float(self.mix)
-        new.pos = int(self.pos); new.buf = np.copy(self.buf); new.enabled = bool(self.enabled)
-        return new
 
-    def to_dict(self):
-        return {"type":"Delay","time_ms":self.time_ms,"feedback":self.feedback,"mix":self.mix,"enabled":self.enabled}
+def create_effect_instance(effect_type: str) -> EffectInstance:
+    param_meta = get_param_meta(effect_type)
+    defaults = [p[3] for p in param_meta]
+    params = np.array(defaults, dtype=np.float32)
+    return EffectInstance(effect_type=effect_type, enabled=True, params=params)
 
-    @staticmethod
-    def from_dict(d, sr, blocksize):
-        e = Delay(sr, blocksize)
-        e.time_ms = float(d.get("time_ms", e.time_ms))
-        e.feedback = float(d.get("feedback", e.feedback))
-        e.mix = float(d.get("mix", e.mix))
-        e.enabled = bool(d.get("enabled", e.enabled))
-        return e
 
-    def process(self, in_mono):
-        if not self.enabled:
-            self.tmp[:in_mono.shape[0]] = in_mono; return self.tmp
-        delay_samples = self.time_ms * self.sr / 1000.0
-        self.pos = delay_block(in_mono, self.tmp, self.buf, self.pos,
-                               self.buf_len, np.float32(delay_samples),
-                               np.float32(self.feedback),
-                               np.float32(self.mix))
-        return self.tmp
+# ============================================================
+#  エフェクトチェイン（Numba DSP 状態付き）
+# ============================================================
 
-class Reverb:
-    def __init__(self, sr, blocksize):
-        self.sr = sr; self.blocksize = blocksize
-        self.taps = np.array([int(sr*0.029), int(sr*0.037), int(sr*0.043), int(sr*0.053)], dtype=np.int32)
-        self.gains = np.array([0.7, 0.6, 0.5, 0.4], dtype=DTYPE)
-        self.buf_len = int(sr * 6.0); self.buf = np.zeros(self.buf_len, dtype=DTYPE)
-        self.pos = 0; self.lp_cutoff = 6000.0; self.lp_b0, self.lp_a1 = one_pole_coeffs(self.lp_cutoff, sr)
-        self.lp_state = np.zeros(1, dtype=DTYPE); self.tmp = np.zeros(blocksize, dtype=DTYPE)
-        self.enabled = True; self.mix = 0.4; self.name = "Reverb"
-
-    def clone(self):
-        new = Reverb(self.sr, self.blocksize)
-        new.taps = np.copy(self.taps); new.gains = np.copy(self.gains); new.buf = np.copy(self.buf)
-        new.pos = int(self.pos); new.lp_cutoff = float(self.lp_cutoff); new.lp_b0 = float(self.lp_b0)
-        new.lp_a1 = float(self.lp_a1); new.lp_state = np.copy(self.lp_state); new.enabled = bool(self.enabled)
-        new.mix = float(self.mix)
-        return new
-
-    def to_dict(self):
-        return {"type":"Reverb","mix":self.mix,"lp_cutoff":self.lp_cutoff,"enabled":self.enabled}
-
-    @staticmethod
-    def from_dict(d, sr, blocksize):
-        e = Reverb(sr, blocksize)
-        e.mix = float(d.get("mix", e.mix))
-        e.lp_cutoff = float(d.get("lp_cutoff", e.lp_cutoff))
-        e.lp_b0, e.lp_a1 = one_pole_coeffs(e.lp_cutoff, sr)
-        e.enabled = bool(d.get("enabled", e.enabled))
-        return e
-
-    def process(self, in_mono):
-        if not self.enabled:
-            self.tmp[:in_mono.shape[0]] = in_mono; return self.tmp
-        self.pos = reverb_block(in_mono, self.tmp, self.buf, self.buf_len, self.pos,
-                                self.taps, self.gains, np.float32(self.lp_b0), np.float32(self.lp_a1), self.lp_state)
-        out = (1.0 - self.mix) * in_mono + self.mix * self.tmp
-        self.tmp[:in_mono.shape[0]] = out
-        return self.tmp
-
-# ====== チェイン参照（copy-on-write） ======
-_initial_chain = [Distortion(SR, BLOCKSIZE), Chorus(SR, BLOCKSIZE), Delay(SR, BLOCKSIZE)]
-chain_ref = _initial_chain
-
-# ====== 初回コンパイル（事前） ======
-_dummy = np.zeros(BLOCKSIZE, dtype=DTYPE)
-try:
-    _tmp = np.zeros(BLOCKSIZE, dtype=DTYPE)
-    _ = tanh_distort_block(_dummy, _tmp, np.float32(1.0), np.float32(0.5), np.float32(-0.5), np.float32(0.0), np.float32(1.0))
-    _ = chorus_block(_dummy, _tmp, SR, np.float32(5.0), np.float32(0.5), np.float32(0.5), np.float32(0.0), np.zeros(1024, dtype=DTYPE), 0)
-    _ = delay_block(_dummy, _tmp, np.zeros(1024, dtype=DTYPE), 0, 1024, np.float32(100.0), np.float32(0.3), np.float32(0.3))
-    _ = reverb_block(_dummy, _tmp, np.zeros(2048, dtype=DTYPE), 2048, 0, np.array([10,20], dtype=np.int32), np.array([0.5,0.3], dtype=DTYPE), np.float32(0.5), np.float32(-0.5), np.zeros(1, dtype=DTYPE))
-except Exception:
-    pass
-
-# ====== プリセット保存 / 読み込みユーティリティ ======
-def chain_to_preset_dict(chain):
-    preset = []
-    for eff in chain:
-        if hasattr(eff, "to_dict"):
-            preset.append(eff.to_dict())
-    return {"chain": preset, "timestamp": time.time()}
-
-def preset_dict_to_chain(d):
-    new_chain = []
-    for item in d.get("chain", []):
-        t = item.get("type", "")
-        if t == "Distortion":
-            new_chain.append(Distortion.from_dict(item, SR, BLOCKSIZE))
-        elif t == "Chorus":
-            new_chain.append(Chorus.from_dict(item, SR, BLOCKSIZE))
-        elif t == "Delay":
-            new_chain.append(Delay.from_dict(item, SR, BLOCKSIZE))
-        elif t == "Reverb":
-            new_chain.append(Reverb.from_dict(item, SR, BLOCKSIZE))
-    return new_chain
-
-def save_preset_file(name, chain):
-    safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).rstrip()
-    path = os.path.join(PRESET_DIR, f"{safe_name}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(chain_to_preset_dict(chain), f, ensure_ascii=False, indent=2)
-    return path
-
-def load_preset_file(path):
-    with open(path, "r", encoding="utf-8") as f:
-        d = json.load(f)
-    return preset_dict_to_chain(d)
-
-def list_presets():
-    files = []
-    for fn in os.listdir(PRESET_DIR):
-        if fn.lower().endswith(".json"):
-            files.append(fn[:-5])
-    files.sort()
-    return files
-
-def most_recent_preset_path():
-    files = [os.path.join(PRESET_DIR, fn) for fn in os.listdir(PRESET_DIR) if fn.lower().endswith(".json")]
-    if not files:
-        return None
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return files[0]
-
-# ====== オーディオコールバック ======
-def audio_callback(indata, outdata, frames, time, status):
-    if status:
-        print("Stream status:", status)
-    x = indata[:frames, 0].astype(DTYPE, copy=False)
-    local_chain = chain_ref
-    work = x.copy()
-    for eff in local_chain:
-        work = eff.process(work)
-    if outdata.shape[1] >= 2:
-        outdata[:frames, 0] = work
-        outdata[:frames, 1] = work
-    else:
-        outdata[:frames, 0] = work
-
-# ====== GUI：チェイン編集とプリセットUI（自動ロード対応） ======
-class MainWindow(QtWidgets.QWidget):
+class EffectChain:
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Chainable Pedal with Auto-Load Presets")
-        self.resize(900, 520)
-        layout = QtWidgets.QHBoxLayout()
-        left = QtWidgets.QVBoxLayout()
-        right = QtWidgets.QVBoxLayout()
+        self.effects: List[EffectInstance] = []
 
-        # Chain list
-        self.list_widget = QtWidgets.QListWidget()
-        self.refresh_chain_list()
-        left.addWidget(QtWidgets.QLabel("Effect Chain"))
-        left.addWidget(self.list_widget)
+        self.chorus_phase = 0.0
+        self.delay_buf = np.zeros(SAMPLE_RATE * 2, dtype=np.float32)
+        self.delay_write_pos = 0
+        self.reverb_buf = np.zeros(SAMPLE_RATE * 3, dtype=np.float32)
+        self.reverb_idx = 0
 
-        # Buttons for chain
-        btn_layout = QtWidgets.QHBoxLayout()
-        self.add_btn = QtWidgets.QPushButton("Add")
-        self.remove_btn = QtWidgets.QPushButton("Remove")
-        self.up_btn = QtWidgets.QPushButton("Up")
-        self.down_btn = QtWidgets.QPushButton("Down")
-        self.bypass_btn = QtWidgets.QPushButton("Toggle Bypass")
-        btn_layout.addWidget(self.add_btn); btn_layout.addWidget(self.remove_btn)
-        btn_layout.addWidget(self.up_btn); btn_layout.addWidget(self.down_btn)
-        btn_layout.addWidget(self.bypass_btn)
-        left.addLayout(btn_layout)
+    def process_block(self, x: np.ndarray) -> np.ndarray:
+        y = x.astype(np.float32)
 
-        self.add_btn.clicked.connect(self.on_add)
-        self.remove_btn.clicked.connect(self.on_remove)
-        self.up_btn.clicked.connect(self.on_up)
-        self.down_btn.clicked.connect(self.on_down)
-        self.bypass_btn.clicked.connect(self.on_bypass)
-        self.list_widget.currentRowChanged.connect(self.on_select)
+        for eff in self.effects:
+            if not eff.enabled:
+                continue
 
-        # Parameter area
-        self.param_area = QtWidgets.QGroupBox("Parameters")
-        p_layout = QtWidgets.QFormLayout()
-        self.param_area.setLayout(p_layout)
-        right.addWidget(self.param_area)
+            if eff.effect_type == "Distortion":
+                y = dsp_distortion(y, eff.params)
 
-        # Preset controls
-        preset_layout = QtWidgets.QHBoxLayout()
-        self.preset_combo = QtWidgets.QComboBox()
-        self.refresh_preset_list()
-        self.load_preset_btn = QtWidgets.QPushButton("Load Preset")
-        self.save_preset_btn = QtWidgets.QPushButton("Save Preset")
-        self.delete_preset_btn = QtWidgets.QPushButton("Delete Preset")
-        preset_layout.addWidget(self.preset_combo)
-        preset_layout.addWidget(self.load_preset_btn)
-        preset_layout.addWidget(self.save_preset_btn)
-        preset_layout.addWidget(self.delete_preset_btn)
-        right.addLayout(preset_layout)
+            elif eff.effect_type == "Chorus":
+                y, self.chorus_phase = dsp_chorus(
+                    y, eff.params, SAMPLE_RATE, self.chorus_phase
+                )
 
-        self.load_preset_btn.clicked.connect(self.on_load_preset)
-        self.save_preset_btn.clicked.connect(self.on_save_preset)
-        self.delete_preset_btn.clicked.connect(self.on_delete_preset)
+            elif eff.effect_type == "Delay":
+                y, self.delay_write_pos = dsp_delay(
+                    y, eff.params, SAMPLE_RATE,
+                    self.delay_buf, self.delay_write_pos
+                )
 
-        # Device info and stop
-        self.device_label = QtWidgets.QLabel("Devices: see console")
-        right.addWidget(self.device_label)
-        self.stop_btn = QtWidgets.QPushButton("Stop")
-        self.stop_btn.clicked.connect(QtWidgets.QApplication.quit)
-        right.addWidget(self.stop_btn)
+            elif eff.effect_type == "Reverb":
+                y, self.reverb_idx = dsp_reverb(
+                    y, eff.params, self.reverb_buf, self.reverb_idx
+                )
 
-        layout.addLayout(left, 2)
-        layout.addLayout(right, 3)
-        self.setLayout(layout)
+        return y
 
-        self.param_widgets = []
-        if len(chain_ref) > 0:
-            self.list_widget.setCurrentRow(0)
 
-    # chain UI helpers
-    def refresh_chain_list(self):
-        self.list_widget.clear()
-        for eff in chain_ref:
-            state = "[On]" if eff.enabled else "[Bypass]"
-            self.list_widget.addItem(f"{state} {eff.name}")
+chain = EffectChain()
+chain_lock = threading.Lock()
+chain_gui_ids: List[int] = []
+current_selected_index: int = 0
 
-    def on_add(self):
-        items = ("Distortion", "Chorus", "Delay", "Reverb")
-        item, ok = QtWidgets.QInputDialog.getItem(self, "Add Effect", "Type:", items, 0, False)
-        if not ok:
-            return
-        if item == "Distortion":
-            new = Distortion(SR, BLOCKSIZE)
-        elif item == "Chorus":
-            new = Chorus(SR, BLOCKSIZE)
-        elif item == "Delay":
-            new = Delay(SR, BLOCKSIZE)
-        else:
-            new = Reverb(SR, BLOCKSIZE)
-        new_chain = list(chain_ref); new_chain.append(new)
-        self.swap_chain(new_chain); self.refresh_chain_list()
-        self.list_widget.setCurrentRow(len(new_chain)-1)
 
-    def on_remove(self):
-        idx = self.list_widget.currentRow()
-        if idx < 0: return
-        new_chain = list(chain_ref); new_chain.pop(idx)
-        self.swap_chain(new_chain); self.refresh_chain_list()
-        self.list_widget.setCurrentRow(max(0, idx-1))
+# ============================================================
+#  DSP 状態再構築（SR変更時）
+# ============================================================
 
-    def on_up(self):
-        idx = self.list_widget.currentRow()
-        if idx <= 0: return
-        new_chain = list(chain_ref); new_chain[idx-1], new_chain[idx] = new_chain[idx], new_chain[idx-1]
-        self.swap_chain(new_chain); self.refresh_chain_list(); self.list_widget.setCurrentRow(idx-1)
+def rebuild_dsp_state():
+    with chain_lock:
+        chain.delay_buf = np.zeros(SAMPLE_RATE * 2, dtype=np.float32)
+        chain.delay_write_pos = 0
+        chain.reverb_buf = np.zeros(SAMPLE_RATE * 3, dtype=np.float32)
+        chain.reverb_idx = 0
+        chain.chorus_phase = 0.0
 
-    def on_down(self):
-        idx = self.list_widget.currentRow()
-        if idx < 0 or idx >= len(chain_ref)-1: return
-        new_chain = list(chain_ref); new_chain[idx+1], new_chain[idx] = new_chain[idx], new_chain[idx+1]
-        self.swap_chain(new_chain); self.refresh_chain_list(); self.list_widget.setCurrentRow(idx+1)
 
-    def on_bypass(self):
-        idx = self.list_widget.currentRow()
-        if idx < 0: return
-        new_chain = list(chain_ref)
-        new_eff = new_chain[idx].clone(); new_eff.enabled = not new_eff.enabled
-        new_chain[idx] = new_eff; self.swap_chain(new_chain); self.refresh_chain_list(); self.list_widget.setCurrentRow(idx)
+# ============================================================
+#  オーディオコールバック
+# ============================================================
 
-    def clear_param_area(self):
-        layout = self.param_area.layout()
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w: w.deleteLater()
-        self.param_widgets = []
+def audio_callback(indata, outdata, frames, time_info, status):
+    global cpu_load
+    if status:
+        print(status)
 
-    def build_param_ui_for(self, eff, idx):
-        self.clear_param_area()
-        layout = self.param_area.layout()
+    start = time.perf_counter()
 
-        if isinstance(eff, Distortion):
-            gain_label = QtWidgets.QLabel(f"Gain: {eff.gain:.2f}")
-            gain_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); gain_slider.setRange(0, 1200); gain_slider.setValue(int(eff.gain * 100))
-            def on_gain_change(v):
-                gain_label.setText(f"Gain: {v/100.0:.2f}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.gain = v / 100.0; new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            gain_slider.valueChanged.connect(on_gain_change)
+    x = indata[:, 0].copy()
+    with chain_lock:
+        y = chain.process_block(x)
+    outdata[:, 0] = y
+    outdata[:, 1] = y
 
-            cut_label = QtWidgets.QLabel(f"Cutoff: {eff.cutoff:.0f} Hz")
-            cut_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); cut_slider.setRange(20, 20000); cut_slider.setValue(int(eff.cutoff))
-            def on_cut_change(v):
-                cut_label.setText(f"Cutoff: {v} Hz")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.cutoff = float(v); new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            cut_slider.valueChanged.connect(on_cut_change)
+    end = time.perf_counter()
+    block_time = frames / float(SAMPLE_RATE)
+    with cpu_lock:
+        cpu_load = (end - start) / block_time if block_time > 0 else 0.0
 
-            dw_label = QtWidgets.QLabel(f"Dry/Wet: {eff.drywet:.2f}")
-            dw_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); dw_slider.setRange(0, 1000); dw_slider.setValue(int(eff.drywet * 1000))
-            def on_dw_change(v):
-                dw_label.setText(f"Dry/Wet: {v/1000.0:.2f}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.drywet = v / 1000.0; new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            dw_slider.valueChanged.connect(on_dw_change)
 
-            layout.addRow(gain_label, gain_slider); layout.addRow(cut_label, cut_slider); layout.addRow(dw_label, dw_slider)
-            self.param_widgets += [gain_slider, cut_slider, dw_slider]
+# ============================================================
+#  オーディオデバイス / SR / BlockSize 管理
+# ============================================================
 
-        elif isinstance(eff, Chorus):
-            depth_label = QtWidgets.QLabel(f"Depth (ms): {eff.depth_ms:.1f}")
-            depth_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); depth_slider.setRange(1, 50); depth_slider.setValue(int(eff.depth_ms))
-            def on_depth(v):
-                depth_label.setText(f"Depth (ms): {v}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.depth_ms = float(v); new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            depth_slider.valueChanged.connect(on_depth)
+def restart_audio_stream():
+    global audio_stream, current_input_device, current_output_device
 
-            rate_label = QtWidgets.QLabel(f"Rate (Hz): {eff.rate_hz:.2f}")
-            rate_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); rate_slider.setRange(1, 500); rate_slider.setValue(int(eff.rate_hz * 100))
-            def on_rate(v):
-                rate_label.setText(f"Rate (Hz): {v/100.0:.2f}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.rate_hz = v / 100.0; new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            rate_slider.valueChanged.connect(on_rate)
+    if audio_stream is not None:
+        audio_stream.stop()
+        audio_stream.close()
 
-            mix_label = QtWidgets.QLabel(f"Mix: {eff.mix:.2f}")
-            mix_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); mix_slider.setRange(0, 1000); mix_slider.setValue(int(eff.mix * 1000))
-            def on_mix(v):
-                mix_label.setText(f"Mix: {v/1000.0:.2f}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.mix = v / 1000.0; new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            mix_slider.valueChanged.connect(on_mix)
+    audio_stream = sd.Stream(
+        samplerate=SAMPLE_RATE,
+        blocksize=BLOCK_SIZE,
+        channels=2,
+        dtype="float32",
+        callback=audio_callback,
+        device=(current_input_device, current_output_device),
+    )
+    audio_stream.start()
 
-            layout.addRow(depth_label, depth_slider); layout.addRow(rate_label, rate_slider); layout.addRow(mix_label, mix_slider)
-            self.param_widgets += [depth_slider, rate_slider, mix_slider]
 
-        elif isinstance(eff, Delay):
-            time_label = QtWidgets.QLabel(f"Time (ms): {eff.time_ms:.0f}")
-            time_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); time_slider.setRange(1, 2000); time_slider.setValue(int(eff.time_ms))
-            def on_time(v):
-                time_label.setText(f"Time (ms): {v}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.time_ms = float(v); new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            time_slider.valueChanged.connect(on_time)
+def on_input_device_change(sender, app_data):
+    global current_input_device
+    current_input_device = app_data
+    restart_audio_stream()
 
-            fb_label = QtWidgets.QLabel(f"Feedback: {eff.feedback:.2f}")
-            fb_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); fb_slider.setRange(0, 950); fb_slider.setValue(int(eff.feedback * 1000))
-            def on_fb(v):
-                fb_label.setText(f"Feedback: {v/1000.0:.2f}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.feedback = v / 1000.0; new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            fb_slider.valueChanged.connect(on_fb)
 
-            mix_label = QtWidgets.QLabel(f"Mix: {eff.mix:.2f}")
-            mix_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); mix_slider.setRange(0, 1000); mix_slider.setValue(int(eff.mix * 1000))
-            def on_mix(v):
-                mix_label.setText(f"Mix: {v/1000.0:.2f}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.mix = v / 1000.0; new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            mix_slider.valueChanged.connect(on_mix)
+def on_output_device_change(sender, app_data):
+    global current_output_device
+    current_output_device = app_data
+    restart_audio_stream()
 
-            layout.addRow(time_label, time_slider); layout.addRow(fb_label, fb_slider); layout.addRow(mix_label, mix_slider)
-            self.param_widgets += [time_slider, fb_slider, mix_slider]
 
-        elif isinstance(eff, Reverb):
-            mix_label = QtWidgets.QLabel(f"Mix: {eff.mix:.2f}")
-            mix_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); mix_slider.setRange(0, 1000); mix_slider.setValue(int(eff.mix * 1000))
-            def on_mix(v):
-                mix_label.setText(f"Mix: {v/1000.0:.2f}")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.mix = v / 1000.0; new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            mix_slider.valueChanged.connect(on_mix)
+def on_sample_rate_change(sender, app_data):
+    global SAMPLE_RATE
+    SAMPLE_RATE = int(app_data)
+    rebuild_dsp_state()
+    restart_audio_stream()
 
-            lp_label = QtWidgets.QLabel(f"LP Cutoff: {eff.lp_cutoff:.0f} Hz")
-            lp_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); lp_slider.setRange(200, 12000); lp_slider.setValue(int(eff.lp_cutoff))
-            def on_lp(v):
-                lp_label.setText(f"LP Cutoff: {v} Hz")
-                new_chain = list(chain_ref); new_eff = new_chain[idx].clone(); new_eff.lp_cutoff = float(v); new_eff.lp_b0, new_eff.lp_a1 = one_pole_coeffs(new_eff.lp_cutoff, new_eff.sr); new_chain[idx] = new_eff; self.swap_chain(new_chain)
-            lp_slider.valueChanged.connect(on_lp)
 
-            layout.addRow(mix_label, mix_slider); layout.addRow(lp_label, lp_slider)
-            self.param_widgets += [mix_slider, lp_slider]
+def on_block_size_change(sender, app_data):
+    global BLOCK_SIZE
+    BLOCK_SIZE = int(app_data)
+    restart_audio_stream()
 
-    def on_select(self, idx):
-        if idx < 0 or idx >= len(chain_ref):
-            self.clear_param_area(); return
-        eff = chain_ref[idx]; self.build_param_ui_for(eff, idx)
 
-    def swap_chain(self, new_chain):
-        global chain_ref
-        chain_ref = new_chain
+# ============================================================
+#  プリセット保存 / 読み込み
+# ============================================================
 
-    # Preset UI
-    def refresh_preset_list(self):
-        self.preset_combo.clear()
-        for name in list_presets():
-            self.preset_combo.addItem(name)
-
-    def on_save_preset(self):
-        name, ok = QtWidgets.QInputDialog.getText(self, "Save Preset", "Preset name:")
-        if not ok or not name.strip():
-            return
-        path = save_preset_file(name.strip(), chain_ref)
-        self.refresh_preset_list()
-        QtWidgets.QMessageBox.information(self, "Saved", f"Preset saved: {os.path.basename(path)}")
-
-    def on_load_preset(self):
-        name = self.preset_combo.currentText()
-        if not name:
-            QtWidgets.QMessageBox.warning(self, "No preset", "No preset selected.")
-            return
-        path = os.path.join(PRESET_DIR, f"{name}.json")
-        try:
-            new_chain = load_preset_file(path)
-            self.swap_chain(new_chain); self.refresh_chain_list()
-            QtWidgets.QMessageBox.information(self, "Loaded", f"Preset loaded: {name}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load preset: {e}")
-
-    def on_delete_preset(self):
-        name = self.preset_combo.currentText()
-        if not name:
-            return
-        path = os.path.join(PRESET_DIR, f"{name}.json")
-        if not os.path.exists(path):
-            self.refresh_preset_list(); return
-        reply = QtWidgets.QMessageBox.question(self, "Delete Preset", f"Delete preset '{name}'?", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-        if reply == QtWidgets.QMessageBox.Yes:
-            try:
-                os.remove(path)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to delete: {e}")
-            self.refresh_preset_list()
-
-# ====== 実行 ======
-def main():
-    global chain_ref
-    # 自動ロード: presets フォルダ内で最も新しいプリセットを読み込む
-    recent = most_recent_preset_path()
-    if recent:
-        try:
-            new_chain = load_preset_file(recent)
-            if new_chain:
-                chain_ref = new_chain
-                print(f"Auto-loaded preset: {os.path.basename(recent)}")
-        except Exception as e:
-            print("Failed to auto-load preset:", e)
-
-    print("Available devices:")
-    for i, d in enumerate(sd.query_devices()):
-        print(i, d['name'], d['max_input_channels'], d['max_output_channels'])
-    print("If you want to use a specific device, modify sd.Stream(... device=(in_idx,out_idx) ...).")
-
-    sd.default.device = (14, 13)
-    stream = sd.Stream(samplerate=SR, blocksize=BLOCKSIZE, channels=CHANNELS, callback=audio_callback)
+def save_preset(sender, app_data):
+    data = []
+    with chain_lock:
+        for eff in chain.effects:
+            meta = get_param_meta(eff.effect_type)
+            params_dict = {}
+            for i, (name, mn, mx, df) in enumerate(meta):
+                params_dict[name] = float(eff.params[i])
+            data.append({
+                "type": eff.effect_type,
+                "enabled": eff.enabled,
+                "params": params_dict,
+            })
     try:
-        stream.start()
+        with open(PRESET_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print("Preset saved:", PRESET_FILE)
     except Exception as e:
-        print("Failed to start stream:", e); return
+        print("Preset save error:", e)
 
-    app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow(); win.refresh_preset_list(); win.refresh_chain_list()
-    win.show()
-    exit_code = app.exec_()
 
-    stream.stop(); stream.close()
-    sys.exit(exit_code)
+def load_preset(sender, app_data):
+    global current_selected_index
+    try:
+        with open(PRESET_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print("Preset load error:", e)
+        return
+
+    with chain_lock:
+        chain.effects = []
+        for eff_data in data:
+            etype = eff_data.get("type", "Distortion")
+            if etype not in EFFECT_REGISTRY:
+                continue
+            eff = create_effect_instance(etype)
+            eff.enabled = eff_data.get("enabled", True)
+            params_dict = eff_data.get("params", {})
+            meta = get_param_meta(etype)
+            for i, (name, mn, mx, df) in enumerate(meta):
+                if name in params_dict:
+                    v = float(params_dict[name])
+                    if v < mn:
+                        v = mn
+                    if v > mx:
+                        v = mx
+                    eff.params[i] = v
+            chain.effects.append(eff)
+        current_selected_index = 0
+
+    rebuild_chain_gui()
+    rebuild_param_panel()
+
+
+# ============================================================
+#  DAW 風ノブ
+# ============================================================
+
+def daw_knob(label, value_getter, value_setter, min_v, max_v, width=90):
+    knob_id = dpg.generate_uuid()
+
+    with dpg.group():
+        dpg.add_text(label)
+        with dpg.drawlist(width=width, height=width, tag=knob_id):
+            pass
+
+    def redraw():
+        dpg.delete_item(knob_id, children_only=True)
+        v = value_getter()
+        t = (v - min_v) / (max_v - min_v + 1e-9)
+        t = max(0.0, min(1.0, t))
+        angle = math.radians(225 * t - 135)
+
+        cx, cy = width / 2, width / 2
+        r = width / 2 - 8
+
+        dpg.draw_circle((cx, cy), r, color=(60, 60, 60), thickness=4)
+
+        color = (
+            int(100 + 155 * t),
+            int(80 + 50 * t),
+            int(255 - 200 * t),
+        )
+
+        dpg.draw_line(
+            (cx, cy),
+            (cx + r * 0.75 * math.cos(angle),
+             cy + r * 0.75 * math.sin(angle)),
+            color=color,
+            thickness=4,
+        )
+
+        dpg.draw_text((cx - 14, cy + 20), f"{v:.2f}", color=(220, 220, 220))
+
+    redraw()
+
+    def drag(sender, app_data):
+        delta = app_data
+        v = value_getter()
+        v += delta * (max_v - min_v) * 0.005
+        if v < min_v:
+            v = min_v
+        if v > max_v:
+            v = max_v
+        value_setter(v)
+        redraw()
+
+    dpg.set_item_drag_callback(knob_id, drag)
+
+
+# ============================================================
+#  チェイン GUI
+# ============================================================
+
+def rebuild_chain_gui():
+    dpg.delete_item("chain_panel", children_only=True)
+    global chain_gui_ids
+
+    chain_gui_ids = []
+    with chain_lock:
+        effects = list(chain.effects)
+
+    for idx, eff in enumerate(effects):
+        card_id = dpg.generate_uuid()
+        chain_gui_ids.append(card_id)
+
+        color = EFFECT_REGISTRY[eff.effect_type]["color"]
+
+        with dpg.child_window(parent="chain_panel",
+                              height=70,
+                              border=False,
+                              tag=card_id):
+            with dpg.group(horizontal=True):
+                dpg.add_button(width=6, height=50,
+                               enabled=False,
+                               background_color=color)
+
+                with dpg.group():
+                    dpg.add_text(eff.effect_type)
+                    dpg.add_text(f"#{idx}", color=(150, 150, 150))
+
+                def make_toggle_closure(i):
+                    def _toggle(sender, app_data):
+                        with chain_lock:
+                            chain.effects[i].enabled = app_data
+                        rebuild_param_panel()
+                    return _toggle
+
+                dpg.add_checkbox(label="On",
+                                 default_value=eff.enabled,
+                                 callback=make_toggle_closure(idx))
+
+                def make_delete_closure(i):
+                    def _delete():
+                        with chain_lock:
+                            if 0 <= i < len(chain.effects):
+                                chain.effects.pop(i)
+                        rebuild_chain_gui()
+                        rebuild_param_panel()
+                    return _delete
+
+                dpg.add_button(label="X", width=20, callback=make_delete_closure(idx))
+
+            dpg.add_drag_payload(parent=card_id,
+                                 payload_type="EFFECT_INDEX",
+                                 drag_data=idx)
+            dpg.add_drop_callback(card_id, drop_callback)
+
+            def make_select_closure(i):
+                def _select():
+                    global current_selected_index
+                    current_selected_index = i
+                    rebuild_param_panel()
+                return _select
+
+            dpg.set_item_callback(card_id, make_select_closure(idx))
+
+
+def drop_callback(sender, app_data):
+    src_index = app_data
+    with chain_lock:
+        if sender not in chain_gui_ids:
+            return
+        dst_index = chain_gui_ids.index(sender)
+        if src_index == dst_index:
+            return
+        eff = chain.effects.pop(src_index)
+        chain.effects.insert(dst_index, eff)
+
+    rebuild_chain_gui()
+    rebuild_param_panel()
+
+
+# ============================================================
+#  パラメータパネル
+# ============================================================
+
+def rebuild_param_panel():
+    dpg.delete_item("param_panel", children_only=True)
+
+    with chain_lock:
+        if not chain.effects:
+            dpg.add_text("No effects in chain.", parent="param_panel")
+            return
+        idx = min(current_selected_index, len(chain.effects) - 1)
+        eff = chain.effects[idx]
+        meta = get_param_meta(eff.effect_type)
+        params_ref = eff.params
+
+    dpg.add_text(f"{eff.effect_type} Parameters", parent="param_panel")
+    dpg.add_separator(parent="param_panel")
+
+    with dpg.group(horizontal=True, parent="param_panel"):
+        for i, (name, mn, mx, df) in enumerate(meta):
+
+            def make_getter(params_arr, index):
+                return lambda: float(params_arr[index])
+
+            def make_setter(params_arr, index):
+                def _set(v):
+                    params_arr[index] = v
+                return _set
+
+            daw_knob(
+                label=name,
+                value_getter=make_getter(params_ref, i),
+                value_setter=make_setter(params_ref, i),
+                min_v=mn,
+                max_v=mx,
+                width=90,
+            )
+
+
+# ============================================================
+#  CPU メーター更新
+# ============================================================
+
+def update_cpu_meter():
+    with cpu_lock:
+        load = cpu_load
+    if load < 0:
+        load = 0.0
+    if load > 2.0:
+        load = 2.0
+    dpg.set_value("cpu_text", f"CPU Load: {load*100:.1f}%")
+    dpg.set_value("cpu_bar", min(load, 1.0))
+
+
+# ============================================================
+#  メイン GUI
+# ============================================================
+
+def build_gui():
+    global current_input_device, current_output_device
+
+    dpg.create_context()
+    dpg.create_viewport(title="Chainable Pedal (DearPyGui + Numba + NumPy Params)",
+                        width=1150,
+                        height=720)
+
+    devices = sd.query_devices()
+    device_names = [d["name"] for d in devices]
+
+    current_input_device = sd.default.device[0]
+    current_output_device = sd.default.device[1]
+
+    with dpg.window(label="Chainable Pedal",
+                    width=1150,
+                    height=720,
+                    no_move=True,
+                    no_resize=True,
+                    no_collapse=True):
+
+        with dpg.group(horizontal=True):
+            # 左パネル
+            with dpg.child_window(width=300, border=False):
+                dpg.add_text("Effect Chain")
+                dpg.add_separator()
+                with dpg.child_window(tag="chain_panel",
+                                      border=False,
+                                      autosize_x=True,
+                                      autosize_y=True):
+                    pass
+
+                dpg.add_separator()
+                dpg.add_text("Audio Devices")
+                dpg.add_text("Input:")
+                dpg.add_combo(
+                    device_names,
+                    default_value=device_names[current_input_device],
+                    callback=lambda s, a: on_input_device_change(
+                        s, device_names.index(a)
+                    ),
+                )
+
+                dpg.add_text("Output:")
+                dpg.add_combo(
+                    device_names,
+                    default_value=device_names[current_output_device],
+                    callback=lambda s, a: on_output_device_change(
+                        s, device_names.index(a)
+                    ),
+                )
+
+                dpg.add_separator()
+                dpg.add_text("Audio Settings")
+
+                sample_rates = ["44100", "48000", "96000"]
+                block_sizes = ["128", "256", "512", "1024"]
+
+                dpg.add_text("Sample Rate:")
+                dpg.add_combo(
+                    sample_rates,
+                    default_value=str(SAMPLE_RATE),
+                    callback=on_sample_rate_change,
+                )
+
+                dpg.add_text("Block Size:")
+                dpg.add_combo(
+                    block_sizes,
+                    default_value=str(BLOCK_SIZE),
+                    callback=on_block_size_change,
+                )
+
+                dpg.add_separator()
+                dpg.add_text("Preset")
+                dpg.add_button(label="Save Preset", callback=save_preset)
+                dpg.add_button(label="Load Preset", callback=load_preset)
+
+                dpg.add_separator()
+                dpg.add_text("Performance")
+                dpg.add_text("CPU Load: 0.0%", tag="cpu_text")
+                dpg.add_progress_bar(tag="cpu_bar", default_value=0.0, width=250)
+
+            # 右パネル
+            with dpg.child_window(width=830, border=False):
+                dpg.add_text("Parameters")
+                dpg.add_separator()
+                with dpg.child_window(tag="param_panel",
+                                      border=False,
+                                      autosize_x=True,
+                                      autosize_y=True):
+                    pass
+
+        with dpg.group(horizontal=True):
+            dpg.add_spacer(width=10)
+            dpg.add_text("Add Effect:")
+            for eff_name in EFFECT_REGISTRY.keys():
+
+                def make_add_closure(name):
+                    def _add():
+                        with chain_lock:
+                            chain.effects.append(create_effect_instance(name))
+                        rebuild_chain_gui()
+                        rebuild_param_panel()
+                    return _add
+
+                dpg.add_button(label=eff_name,
+                               callback=make_add_closure(eff_name))
+
+    with chain_lock:
+        chain.effects = [
+            create_effect_instance("Distortion"),
+            create_effect_instance("Chorus"),
+            create_effect_instance("Delay"),
+            create_effect_instance("Reverb"),
+        ]
+
+    rebuild_chain_gui()
+    rebuild_param_panel()
+
+    dpg.setup_dearpygui()
+    dpg.show_viewport()
+
+    with dpg.handler_registry():
+        dpg.add_timer(callback=lambda: update_cpu_meter(), delay=0.2)
+
+
+# ============================================================
+#  メイン
+# ============================================================
+
+def warmup_numba():
+    dummy = np.zeros(BLOCK_SIZE, dtype=np.float32)
+    _ = dsp_distortion(dummy, np.array([5.0, 0.7], dtype=np.float32))
+    _ = dsp_chorus(dummy,
+                   np.array([1.0, 3.0, 0.5], dtype=np.float32),
+                   SAMPLE_RATE, 0.0)
+    _ = dsp_delay(dummy,
+                  np.array([300.0, 0.4, 0.5], dtype=np.float32),
+                  SAMPLE_RATE,
+                  np.zeros(SAMPLE_RATE * 2, dtype=np.float32), 0)
+    _ = dsp_reverb(dummy,
+                   np.array([0.6, 0.3, 0.5], dtype=np.float32),
+                   np.zeros(SAMPLE_RATE * 3, dtype=np.float32), 0)
+
+
+def main():
+    warmup_numba()
+    build_gui()
+    rebuild_dsp_state()
+    restart_audio_stream()
+    try:
+        dpg.start_dearpygui()
+    finally:
+        if audio_stream:
+            audio_stream.stop()
+            audio_stream.close()
+        dpg.destroy_context()
+
 
 if __name__ == "__main__":
     main()
+    
+    
