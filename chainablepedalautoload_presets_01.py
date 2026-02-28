@@ -383,98 +383,106 @@ def drop_callback(sender, app_data):
     rebuild_param_panel()
 
 
-def rebuild_chain_gui():
-    dpg.delete_item("chain_panel", children_only=True)
-    global chain_gui_ids
 
+
+def rebuild_chain_gui():
+    global chain_gui_ids, current_selected_index
+
+    dpg.delete_item("chain_panel", children_only=True)
     chain_gui_ids = []
+
     with chain_lock:
         effects = list(chain.effects)
+        n = len(effects)
 
     for idx, eff in enumerate(effects):
-        card_id = dpg.generate_uuid()
-        chain_gui_ids.append(card_id)
+        eff_name = eff.effect_type
+        color = EFFECT_REGISTRY[eff_name]["color"]
 
-        color = EFFECT_REGISTRY[eff.effect_type]["color"]
+        # カードのタグ
+        card_tag = f"effect_card_{idx}"
+        chain_gui_ids.append(card_tag)
 
-        with dpg.child_window(parent="chain_panel",
-                              height=70,
-                              border=False,
-                              tag=card_id):
+        # カード本体
+        dpg.add_selectable(
+            label=f"{idx+1}. {eff_name}",
+            tag=card_tag,
+            span_columns=True,
+            callback=lambda s, a: on_select_effect(s),
+            parent="chain_panel"
+        )
 
-            with dpg.group(horizontal=True):
-                # 左のカラーライン
-                add_color_bar(parent=card_id, color=color)
+        # 選択状態の復元
+        if idx == current_selected_index:
+            dpg.set_value(card_tag, True)
 
-                # エフェクト名と番号
-                with dpg.group():
-                    dpg.add_text(eff.effect_type)
-                    dpg.add_text(f"#{idx}", color=(150, 150, 150))
+        # 上下移動ボタン
+        with dpg.group(horizontal=True, parent="chain_panel"):
+            up_tag = f"effect_up_{idx}"
+            down_tag = f"effect_down_{idx}"
+            remove_tag = f"effect_remove_{idx}"
 
-                # ON/OFF
-                def make_toggle_closure(i):
-                    def _toggle(sender, app_data):
-                        with chain_lock:
-                            chain.effects[i].enabled = bool(app_data)
-                        rebuild_param_panel()
-                    return _toggle
+            dpg.add_button(label="UP", tag=up_tag,
+                           callback=lambda s, a: on_move_effect(s))
 
-                dpg.add_checkbox(label="On",
-                                 default_value=eff.enabled,
-                                 callback=make_toggle_closure(idx))
+            dpg.add_button(label="DOWN", tag=down_tag,
+                           callback=lambda s, a: on_move_effect(s))
 
-                # ▼ 下へ移動
-                def make_move_down_closure(i):
-                    def _move(sender, app_data):
-                        with chain_lock:
-                            if i < len(chain.effects) - 1:
-                                chain.effects[i], chain.effects[i+1] = chain.effects[i+1], chain.effects[i]
-                        rebuild_chain_gui()
-                        rebuild_param_panel()
-                    return _move
+            dpg.add_button(label="REMOVE", tag=remove_tag,
+                           callback=lambda s, a: on_remove_effect(s))
 
-                dpg.add_button(label="▼", width=25, callback=make_move_down_closure(idx))
+        dpg.add_separator(parent="chain_panel")
 
-                # ▲ 上へ移動
-                def make_move_up_closure(i):
-                    def _move(sender, app_data):
-                        with chain_lock:
-                            if i > 0:
-                                chain.effects[i], chain.effects[i-1] = chain.effects[i-1], chain.effects[i]
-                        rebuild_chain_gui()
-                        rebuild_param_panel()
-                    return _move
 
-                dpg.add_button(label="▲", width=25, callback=make_move_up_closure(idx))
+def on_select_effect(sender):
+    global current_selected_index
 
-                # 削除ボタン
-                def make_delete_closure(i):
-                    def _delete(sender, app_data):
-                        with chain_lock:
-                            chain.effects.pop(i)
-                        rebuild_chain_gui()
-                        rebuild_param_panel()
-                    return _delete
+    idx = int(sender.split("_")[-1])
+    current_selected_index = idx
 
-                dpg.add_button(label="X", width=20, callback=make_delete_closure(idx))
+    # ハイライト更新
+    for i, tag in enumerate(chain_gui_ids):
+        dpg.set_value(tag, i == idx)
 
-            # -------------------------
-            # カード選択（透明 selectable）
-            # -------------------------
-            select_id = dpg.generate_uuid()
-            dpg.add_selectable(label="", parent=card_id, tag=select_id, span_columns=True)
+    rebuild_param_panel()
 
-            def make_select_closure(i):
-                def _select(sender, app_data):
-                    global current_selected_index
-                    current_selected_index = i
-                    rebuild_param_panel()
-                return _select
 
-            with dpg.item_handler_registry() as handler:
-                dpg.add_item_clicked_handler(callback=make_select_closure(idx))
+def on_move_effect(sender):
+    global current_selected_index
 
-            dpg.bind_item_handler_registry(select_id, handler)
+    parts = sender.split("_")
+    direction = parts[-2]   # "up" or "down"
+    idx = int(parts[-1])
+
+    with chain_lock:
+        if direction == "up" and idx > 0:
+            chain.effects[idx], chain.effects[idx - 1] = chain.effects[idx - 1], chain.effects[idx]
+            current_selected_index = idx - 1
+
+        elif direction == "down" and idx < len(chain.effects) - 1:
+            chain.effects[idx], chain.effects[idx + 1] = chain.effects[idx + 1], chain.effects[idx]
+            current_selected_index = idx + 1
+
+    rebuild_chain_gui()
+    rebuild_param_panel()
+
+
+def on_remove_effect(sender):
+    global current_selected_index
+
+    idx = int(sender.split("_")[-1])
+
+    with chain_lock:
+        if 0 <= idx < len(chain.effects):
+            chain.effects.pop(idx)
+
+            # 選択位置調整
+            if current_selected_index >= len(chain.effects):
+                current_selected_index = max(0, len(chain.effects) - 1)
+
+    rebuild_chain_gui()
+    rebuild_param_panel()
+
 
 
 # ============================================================
@@ -734,7 +742,15 @@ def build_gui():
                         height=720)
 
     devices = sd.query_devices()
-    device_names = [d["name"] for d in devices]
+    print(devices)
+    #device_names = [d["name"] for d in devices]
+    #device_names = [f"{i}: {d['name']}" for i, d in enumerate(devices)]
+    device_names = [
+        f"{i}: {d['name']} "
+        f"(In:{d['max_input_channels']} Out:{d['max_output_channels']})"
+        for i, d in enumerate(devices)
+    ]
+    print(device_names)
 
     current_input_device = sd.default.device[0]
     current_output_device = sd.default.device[1]
@@ -858,6 +874,13 @@ def build_gui():
 
     rebuild_chain_gui()
     rebuild_param_panel()
+
+    with dpg.font_registry():
+        with dpg.font("C:/Windows/Fonts/meiryo.ttc", 18) as default_font:
+            dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
+            dpg.add_font_range_hint(dpg.mvFontRangeHint_Japanese)
+
+    dpg.bind_font(default_font)
 
     dpg.setup_dearpygui()
     dpg.show_viewport()
